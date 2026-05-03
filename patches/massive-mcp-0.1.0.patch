@@ -1,0 +1,86 @@
+--- /tmp/mcp-unpack/dist/index.js	2026-05-01 20:25:34
++++ /tmp/mcp-patched/dist/index.js	2026-05-03 13:01:18
+@@ -212,6 +212,24 @@
+   device: z.string().optional().describe("Device emulation name (e.g. 'iphone-15')")
+ };
+ var InputSchema = z.object(webFetchInput);
++var ERROR_PAGE_PATTERNS = [
++  /\bFile Not Found\b/i,
++  /\b404 Not Found\b/i,
++  /\b403 Forbidden\b/i,
++  /\b500 Internal Server Error\b/i,
++  /\bAccess Denied\b/i,
++  /\bThis page (?:isn'?t|isn't|is not) available\b/i,
++  /\bthe page you (?:were )?looking for (?:doesn'?t|does not) exist\b/i
++];
++function detectErrorPage(body) {
++  if (!body) return null;
++  const head = body.slice(0, 2048);
++  for (const re of ERROR_PAGE_PATTERNS) {
++    const m = head.match(re);
++    if (m) return m[0];
++  }
++  return null;
++}
+ async function webFetchHandler(input, client) {
+   try {
+     const parsed = InputSchema.parse(input);
+@@ -222,11 +240,16 @@
+       city: parsed.city,
+       device: parsed.device
+     });
++    const errorMatch = detectErrorPage(body);
+     const structured = {
+       format: parsed.format,
+       url: parsed.url,
+       bytes: Buffer.byteLength(body, "utf8")
+     };
++    if (errorMatch) {
++      structured.looks_like_error_page = true;
++      structured.error_page_match = errorMatch;
++    }
+     if (parsed.country) structured.country = parsed.country;
+     if (parsed.city) structured.city = parsed.city;
+     if (parsed.device) structured.device = parsed.device;
+@@ -450,6 +473,9 @@
+ 
+ // src/parsers/ai-html.ts
+ import * as cheerio2 from "cheerio";
++var MODEL_PREFIX_RE = /^\s*(ChatGPT|Gemini|Copilot|Perplexity)\s+said[:\s]*/i;
++var PERPLEXITY_CITATION_TOKEN_RE = /\s*[a-z][a-z0-9.-]*\.[a-z]{2,}\+\d+/gi;
++var TRAILING_UI_CHROME_RE = /\n+(JSON|Show all|Show more|Edit in a page)\b.*$/gms;
+ function stripCompletionHtml(html) {
+   if (!html) return "";
+   const $ = cheerio2.load(`<div id="root">${html}</div>`);
+@@ -460,7 +486,15 @@
+     $(el).append("\n");
+   });
+   const text = $("#root").text();
+-  return text.replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
++  return text
++    .replace(/[ \t]+\n/g, "\n")
++    .replace(/\n[ \t]+/g, "\n")
++    .replace(/[ \t]{2,}/g, " ")
++    .replace(/\n{3,}/g, "\n\n")
++    .replace(MODEL_PREFIX_RE, "")
++    .replace(PERPLEXITY_CITATION_TOKEN_RE, "")
++    .replace(TRAILING_UI_CHROME_RE, "")
++    .trim();
+ }
+ function parseSourcesHtml(html) {
+   if (!html) return [];
+@@ -511,7 +545,13 @@
+ function registerAiChat(server, client) {
+   server.tool(
+     "ai_chat_completion",
+-    "Get a chatbot answer (ChatGPT, Gemini, Perplexity, or Copilot) with structured sources. Cost: 1 credit base.",
++    "Ask one chatbot a free-text question and get back its answer with structured sources. " +
++    "Model selection guide: 'perplexity' (best citation coverage, slowest tail) for sourced/recent facts; " +
++    "'gemini' (fast, ~10s) for general analysis or structured-output prompts; " +
++    "'chatgpt' (~15s) for general knowledge — but it may confidently hallucinate niche topics and often returns 0 sources; " +
++    "'copilot' (slowest, 30-60s+) for thorough answers. " +
++    "For verifiable facts prefer 'web_search' or fan out across models with 'ai_chat_compare' if available. " +
++    "Cost: 1 credit base.",
+     aiChatInput,
+     async (args) => aiChatHandler(args, client)
+   );

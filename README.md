@@ -16,11 +16,21 @@ Massive's docs frame the API as a way to query an LLM. The more interesting fram
 
 ## What I built
 
-Three small Python modules, stdlib only, no `pip install`:
+Pure-stdlib Python — no `pip install`.
 
-- **`massive.py`** — clean wrapper around the API. Strips HTML out of the `completion` payload (more on that below), parses `sources` into a structured `[{url, title}]` list, retries on 5xx, and exposes `ask_all(prompt)` that fans out to all four models in parallel.
-- **`consensus.py`** — CLI that asks all four models the same question and renders aligned answers + a "source-domain overlap" panel showing which domains were cited by 2+ models (rough cross-LLM credibility signal).
-- **`enrich.py`** — lead-enrichment workflow. For each company name, asks all four models for a single structured JSON object (one-line pitch, B2B/B2C, founders, HQ, YC batch, hiring status), parses each, votes per field, and flags disagreement with `⚠ DISAGREE` so a human knows exactly what to verify by hand.
+**The consensus toolkit:**
+- **`massive.py`** — clean wrapper around the API. Strips HTML out of the `completion` payload, parses `sources` into a structured `[{url, title}]` list, retries on 5xx, exposes `ask_all(prompt)` that fans out to all four models in parallel.
+- **`consensus.py`** — CLI that asks all four models the same question and renders aligned answers + a "source-domain overlap" panel showing which domains were cited by 2+ models. Has a `--via-mcp DIST_INDEX_JS` flag that fans out via Massive's official MCP server over stdio JSON-RPC instead of the raw HTTP API — validates that the MCP surface alone is enough for the consensus workflow.
+- **`enrich.py`** — lead-enrichment workflow. For each company name, asks all four models for a single structured JSON object (one-line pitch, B2B/B2C, founders, HQ, YC batch, hiring status), parses each, votes per field, and flags disagreement with `⚠ DISAGREE`.
+
+**Implementations of the top three feedback asks** (so the founder can run them, not just read about them):
+- **`compare_mcp.py`** — drop-in standalone MCP server exposing `ai_chat_compare(prompt, models?, fastest_n?)`, the missing 5th tool from the feedback. Pure-stdlib stdio JSON-RPC; no SDK dependency. Returns aligned per-model answers + cross-model source-domain consensus + an optional fast-fail-on-laggard knob.
+- **`patches/massive-mcp-0.1.0.patch`** — unified diff against the unpacked `dist/index.js` implementing four trivial fixes from the feedback: prefix stripping, Perplexity citation-token cleanup, trailing UI chrome removal, an error-page heuristic in `web_fetch`'s `structuredContent`, and a richer model-selection guide in the `ai_chat_completion` tool description. Applied + verified working — see [`patches/README.md`](./patches/README.md).
+
+**MCP-side test harness** (used to verify everything above):
+- **`mcp_probe.py` / `mcp_probe2.py`** — drove Massive's MCP server directly over stdio JSON-RPC for a 12-test matrix, before any patches.
+- **`test_compare_mcp.py`** — smoke-tests `compare_mcp.py` end-to-end via stdio.
+- **`test_patched.py`** — verifies the patched MCP fixes the issues each patch was meant to fix.
 
 ## How it performed in real use
 
@@ -129,8 +139,28 @@ If I had to pick three:
 ```sh
 export MASSIVE_TOKEN=...   # https://dashboard.joinmassive.com/developer/api-keys
 
+# Consensus across 4 models via direct HTTP
 python3 consensus.py "What does the YC company Browserbase do, and who founded it?"
+
+# Same, but routed through Massive's official MCP server via stdio
+python3 consensus.py --via-mcp /path/to/massive-mcp/dist/index.js "..."
+
+# Lead enrichment with per-field consensus + disagreement flags
 python3 enrich.py "Tsenta" "Pentagon" "Control Seat" --csv-out enriched.csv
+```
+
+**Run the standalone `ai_chat_compare` MCP server** (drop into Claude Desktop config or any MCP client):
+
+```json
+{
+  "mcpServers": {
+    "massive-compare": {
+      "command": "python3",
+      "args": ["/absolute/path/to/compare_mcp.py"],
+      "env": { "MASSIVE_TOKEN": "your-token" }
+    }
+  }
+}
 ```
 
 Pure stdlib. No `pip install`.
