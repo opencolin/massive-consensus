@@ -46,70 +46,83 @@ Three patterns showed up over and over:
 2. **Consensus is not truth.** All three models that returned data agreed on `Tsenta HQ = Indianapolis`. The actual address is Rose-Hulman in Terre Haute. When models share the same upstream training-data error, agreement doesn't validate. Sources are what matter — which leads directly to the feedback section.
 3. **One model is a 5x latency outlier.** Three models returned in 11–30s. Copilot timed out past 75s on every JSON-style prompt I gave it. Without a timeout knob, every consensus call takes as long as the slowest model.
 
-## Review of the Massive AI Chat API + MCP
+## Review of the Massive MCP server
 
-Caveat up front: I tested the underlying HTTP API directly (Claude Code, not Claude Desktop), so the MCP packaging itself is judged through the lens of "what would the wrapped tool feel like for an agent caller." The feedback is mostly about the API contract that the MCP exposes; full notes are in [`FEEDBACK.md`](./FEEDBACK.md).
+Two passes: HTTP API tested directly with `consensus.py` and `enrich.py`, then the MCP server unpacked, source-read, and driven over stdio JSON-RPC for a 12-test matrix. Full writeup in [`FEEDBACK.md`](./FEEDBACK.md).
 
-### What's genuinely good
+### What I love
 
-- **The multi-model fanout is a real moat.** No other API I know of lets you hit four consumer-LLMs in one place. This is the headline.
-- **Perplexity's `sources` are excellent** — clean URLs, deduped, ranked. Best-in-class.
-- **Built-in caching** with `expiration` is well-designed for repeated runs (lead enrichment naturally retries).
-- **Auth is dead simple** — Bearer token, done.
-- **Latency on the fast 3 models** (~10–30s) is reasonable for the depth of answer you get back.
+- **Four well-chosen tools, not just one.** `web_fetch` (URL → Markdown), `web_search` (parsed Google SERP), `ai_chat_completion`, `account_status`. The bundle is broader and more useful than the AI-Chat docs alone suggest.
+- **Markdown is the default for `web_fetch`** — the right default for LLM context.
+- **`web_search` exists, is fast (~2–8s), and is parsed** (organic + AI overview + people-also-ask). This was a pleasant surprise — promote it harder, it's arguably the most generally useful tool.
+- **`ai_chat_completion` strips HTML server-side** (cheerio) and returns sources as a structured `[{title, url}]` array. The two biggest pain points from raw-API testing are *fixed at the MCP layer*.
+- **Validation errors are clean MCP errors** with structured Zod paths — agents can self-correct.
+- **`.mcpb` install with OS-keychain token storage** — great UX win for non-technical users.
 
-### Top gotchas, ranked by how much they hurt programmatic use
+### Top MCP-layer gotchas, ranked
 
-#### 1. `format=json` returns HTML inside the JSON envelope
-The response is JSON, but `completion`, `prompt`, **and** `sources` are HTML strings. Every consumer has to ship an HTML stripper. A 2-sentence Gemini answer comes back as ~30 KB of chat-app DOM. Worse, `prompt` returns the rendered chat-UI HTML for the user's own query — surfacing the chat site's frontend into every API consumer.
+#### 1. There is no `compare_models` / fanout tool
+The single most differentiated capability of this product (4 LLMs through one API) is **not** a first-class tool — every developer who wants consensus has to fan out themselves. I wrote one in this repo (`consensus.py`); literally every other dev who hits this product seriously will too.
 
-**Ask:** add `format=text` (or `format=plain`) returning `{model, answer, sources: [{url, title, snippet}]}`. The current shape leaks the AI-chat-site DOM into every downstream tool.
+**Ask:** ship a 5th tool — `ai_chat_compare(prompt, models?, fastest_n?)` — that fans out, returns aligned answers, flags inter-model disagreement, and unions sources across models with provenance. **This is the killer feature. Let it be the headline tool.**
 
-#### 2. `sources` coverage varies wildly per model — sometimes empty
-Same query ("What is the Massive web render API?"):
+#### 2. The MCP doesn't strip the model's own prefix decoration
+Every `ai_chat_completion` response leaks the source UI's chrome:
 
-| Model | Sources extracted |
+| Model | Prefix observed |
 |---|---|
-| Perplexity | 11 |
-| Copilot | 1 |
-| Gemini | 1 |
-| ChatGPT | **0** |
+| ChatGPT | `"ChatGPT said:\n..."` |
+| Gemini | `"Gemini said\nJSON\n..."` |
+| Copilot | `"Copilot said\n...\nShow all\nEdit in a page"` |
+| Perplexity | (no prefix, but inline tokens like `"research.contrary+2"` leak through) |
 
-For lead enrichment, sources *are* the deliverable. Citing "Indianapolis" with zero sources is worse than useless. The chat UIs all show citation markers — the API should return them as a structured array, not regex-out hrefs from raw HTML.
+The MCP source has a beautiful `stripCompletionHtml` cheerio function — but skips this trivial last-mile cleanup. **Ask:** strip the `^(ChatGPT|Gemini|Copilot|Perplexity)\s+said[:\s]*` prefix and remove perplexity inline citation tokens once they're already structured into `sources`.
 
-#### 3. Copilot is unreliable for structured-output prompts
-3/3 of my real enrichment runs, Copilot did not return inside 75s and timed out (server still running — total elapsed including one retry was 152s). The other three models returned in 11–30s. With a tighter SLA, every enrichment looks like "75% of models responded."
+#### 3. Default per-call timeout is 180s — too patient for agentic use
+`DEFAULT_TIMEOUT_MS = 180000` (3 min). Observed latencies in my matrix:
 
-**Ask:** document realistic per-model p95 latency (the docs say "up to 3 minutes" but the practical 95% on the fast three is ~30s — copilot is the outlier), and add a `fastest_n=3` knob so callers can stop waiting on the laggard.
+| Tool | Observed elapsed |
+|---|---|
+| `account_status` | 0.4s |
+| `web_fetch` | 0.6–0.9s |
+| `web_search` | 2.5–8s |
+| `ai_chat_completion` (gemini) | 7–8s |
+| `ai_chat_completion` (chatgpt) | 14–15s |
+| `ai_chat_completion` (perplexity) | 18–51s |
+| `ai_chat_completion` (copilot) | 35s nominal — 152s on structured-output prompts in raw-API tests |
 
-#### 4. Single-model answers can hallucinate badly
-First smoke test, I asked ChatGPT what Massive does. It confidently described it as *"a tool that enables real-time rendering of 3D models and immersive environments directly in web browsers"* — completely wrong. Gemini, Perplexity, and Copilot all got it right. This isn't really a Massive bug — it's a property of cold ChatGPT queries on niche topics — but it's worth surfacing in docs that single-model AI Chat answers should never be trusted for niche/recent facts, and that fanning out across models is the documented mitigation.
+A 3-minute hang inside an agent loop is a UX disaster. **Ask:** set a smarter default per tool and document realistic p95 per model.
 
-#### 5. Each model adds redundant prefix decoration
-`"ChatGPT said: ..."`, `"Gemini said\n\n..."`, `"Copilot said\n\n..."`, (Perplexity none). Trivial to strip but every consumer ends up writing the same regex.
+#### 4. `web_fetch` silently returns 404 pages as success
+`web_fetch("https://www.ycombinator.com/companies/browserbase", "markdown")` returned `is_error: false` with text content `"Y Combinator | File Not Found / # 404 / ..."`. The `structuredContent` only has `{format, url, bytes}` — no `status_code`. The agent has to *read* the page content to know the request 404'd. **Ask:** include the upstream HTTP status (and `redirect_chain`) in `structuredContent`. Surface non-2xx as MCP errors.
 
-#### 6. `/ai/devices` returns `[]`
-Documented as the source of valid `device` names. Returns an empty list. Stale doc or unshipped endpoint.
+#### 5. Hardcoded Google selectors in `web_search`
+`web_search` parses with cheerio and hardcoded class names: `.yuRUbf`, `.pOOWX`, `.VwiC3b`, `.related-question-pair`. The source comments even say *"current (2026) AIO answer container"* — you know it's brittle. A Google A/B test rotates one class and the tool returns `{organic: [], ai_overview: null}` silently. **Ask:** add a `parser_version` tag, expose `parsed_count`, emit a metric on empty-result regressions.
 
-#### 7. Payload size
-Gemini returned 1.4 MB for a 2-sentence answer — driven by an embedded `html` field that's the full chat page DOM. For high-throughput enrichment, an `?include=completion,sources` opt-out would matter.
+#### 6. Markdown output is half-markdown / half-HTML
+`web_fetch("https://news.ycombinator.com", "markdown")` returned 13.8 KB containing literal `<table>`, `<tr>`, `<td>` tags interleaved with markdown links. Agents end up parsing a hybrid. **Ask:** commit to full HTML→markdown of block-level structure or rename `format: "mixed"`.
 
-#### 8. No streaming
-A 30-second call with no intermediate output looks like a hung connection. Even partial-completion streaming would make this feel like the chat-API products it wraps.
+#### 7. Tool descriptions don't help the LLM choose
+`ai_chat_completion`'s description: *"Get a chatbot answer (ChatGPT, Gemini, Perplexity, or Copilot) with structured sources. Cost: 1 credit base."* This says nothing about: when to use it instead of `web_search`, which model to pick, hallucination risk, or that `sources` may be empty.
 
-#### 9. Unnormalized model output
-For `yc_batch`, the same company came back as `"Spring 2026"`, `"S26"`, and `"YC S26"`. A small server-side canonical enum would massively reduce post-processing pain.
+In contrast `web_fetch`'s description is rich (capabilities, geo-targeting, pricing). **Ask:** rewrite `ai_chat_completion`'s similarly: *"Use Perplexity for sourced/recent facts (best citation coverage), ChatGPT for general analysis, Gemini for fast structured output, Copilot for thorough but slower answers. For verifiable facts, prefer `web_search` or fan out across models."*
 
-#### 10. The MCP probably exposes a single `ask` tool
-Without unpacking the .mcpb I'm guessing — but the differentiated capability of this product is *multi-model fanout*, not asking a single LLM. Every developer is going to rebuild this. **The MCP should ship a first-class `compare_models` tool** that fans out to all four and returns aligned answers + per-field agreement. That's the killer feature; let it be the headline tool.
+#### 8. Single-model hallucination passthrough
+On the cold-query test ("What is the JoinMassive Web Render API?"), ChatGPT confidently invented *"a cloud-based rendering platform... 3D scenes, animations, and simulations..."* — completely wrong. Perplexity got it right, but in a degraded "I don't have tools access" mode and called the company "Masssive". The MCP returns whatever the model gave with no warning or fallback. **Ask:** optional `fallback_models` arg — if the primary returns 0 sources or below a confidence threshold, retry with the fallback. Or just bake this into `ai_chat_compare`.
+
+#### 9. `account_status` returns a unitless number with a hardcoded threshold
+`"99832 credits remaining."` But what does a credit cost? What's the spend rate? The `low_balance` flag flips at <100 — for a heavy user that's "30 seconds left." **Ask:** include `usd_remaining`, `credits_used_30d`, `estimated_days_at_current_rate`. Make the low-balance threshold configurable.
+
+#### 10. Source coverage varies wildly across models (passthrough)
+Same query, source counts: Perplexity 11, ChatGPT 0. ChatGPT and Gemini show inline citation markers in their UIs but the API can't extract them, so the MCP can't surface them either. **Ask (API layer):** real inline-citation extraction.
 
 ### Bottom-line product asks
 
 If I had to pick three:
 
-1. **`format=text`** — return parsed completion + structured sources. Stop leaking HTML.
-2. **First-class `compare` MCP tool** — fan out to all models, return aligned answers + agreement flags. The thing every developer will build anyway.
-3. **Per-model SLA + a `fastest_n` knob** — Copilot's tail latency makes the slow path the slow path. Let callers opt out.
+1. **Ship `ai_chat_compare`.** The killer feature; not building it is leaving the moat on the table.
+2. **Last-mile cleanup of `ai_chat_completion`** — strip "Model said:" prefix, drop inline citation tokens, surface upstream HTTP status on `web_fetch`. All small, all visible to every agent call.
+3. **Per-tool timeout defaults + observability for `web_search` parsers** — 180s blanket is wrong; hardcoded Google selectors will silently rot.
 
 ## Usage
 
